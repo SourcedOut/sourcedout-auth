@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head><title>OutreachAI Login</title></head>
+<body>
+<p>Logging you in...</p>
+<script>
+  window.onload = function() {
+    const hash = window.location.hash;
+    if (hash && hash.includes('access_token')) {
+      window.close();
+    }
+  }
+</script>
+</body>
+</html>
