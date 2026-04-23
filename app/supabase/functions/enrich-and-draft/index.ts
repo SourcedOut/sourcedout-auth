@@ -98,6 +98,306 @@ async function enrichWithLinkedInV2(linkedinUrl: string, key: string): Promise<{
   throw new Error('FullEnrich timeout — enrichment did not complete within 55s')
 }
 
+// ── Waterfall Step 3: Claude Haiku email pattern guess ──
+async function generateEmailPatterns(fullName: string, companyHint: string | null, anthropicKey: string): Promise<string[]> {
+  if (!anthropicKey || !fullName || !companyHint) return []
+  const prompt = `Given a person's full name and their employer (company name or domain), produce the 2-3 most likely work email addresses ranked by probability.
+
+Person: "${fullName}"
+Employer: "${companyHint}"
+
+Rules:
+- If the employer looks like a domain (contains a dot), use it directly.
+- If it is a company name, infer the most likely primary email domain (e.g. "Stripe" -> "stripe.com").
+- Use common corporate patterns: firstname.lastname@domain, flastname@domain, firstname@domain, firstinitiallastname@domain.
+- Lowercase everything. Strip accents and punctuation from the name.
+
+Return ONLY JSON: {"candidates":["email1","email2","email3"]}`
+  const raw = await callAnthropic(anthropicKey, 'claude-haiku-4-5', 200, prompt)
+  const p = parseJson(raw)
+  const list = Array.isArray(p.candidates) ? p.candidates : []
+  return list.filter((e: any) => typeof e === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e))
+}
+
+// ── Waterfall Step 4: Google Custom Search for public emails ──
+async function searchGoogleForEmail(firstName: string, lastName: string, companyHint: string | null, googleKey: string, googleCx: string): Promise<string[]> {
+  if (!googleKey || !googleCx) return []
+  const nameQuery = `${firstName || ''} ${lastName || ''}`.trim()
+  if (!nameQuery) return []
+  const companyPart = companyHint ? `"${companyHint}"` : ''
+  const q = `"${nameQuery}" ${companyPart} email`.trim()
+  const url = `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(googleKey)}&cx=${encodeURIComponent(googleCx)}&q=${encodeURIComponent(q)}`
+  try {
+    const res = await fetch(url)
+    if (!res.ok) return []
+    const data = await res.json()
+    const items = Array.isArray(data.items) ? data.items : []
+    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g
+    const found = new Set<string>()
+    for (const item of items) {
+      const text = `${item.snippet || ''} ${item.link || ''} ${item.title || ''}`
+      const matches = text.match(emailRegex) || []
+      for (const m of matches) found.add(m.toLowerCase())
+    }
+    return Array.from(found)
+  } catch {
+    return []
+  }
+}
+
+// ── Waterfall Step 5: verify an email via MyEmailVerifier with Kickbox fallback ──
+async function verifyEmail(email: string, myemailverifierKey: string, kickboxKey: string): Promise<{ verified: boolean; method: 'myemailverifier' | 'kickbox' | 'none'; result: string | null }> {
+  if (!email) return { verified: false, method: 'none', result: null }
+  if (myemailverifierKey) {
+    try {
+      const res = await fetch(`https://api.myemailverifier.com/verify?secret=${encodeURIComponent(myemailverifierKey)}&email=${encodeURIComponent(email)}`)
+      if (res.ok) {
+        const data = await res.json()
+        const status = String(data?.status || data?.result || '').toLowerCase()
+        if (status === 'valid' || status === 'accept_all') {
+          return { verified: true, method: 'myemailverifier', result: status }
+        }
+        return { verified: false, method: 'myemailverifier', result: status || 'unknown' }
+      }
+    } catch (e) { console.warn('MyEmailVerifier failed, trying Kickbox:', e) }
+  }
+  if (kickboxKey) {
+    try {
+      const res = await fetch(`https://api.kickbox.com/v2/verify?email=${encodeURIComponent(email)}&apikey=${encodeURIComponent(kickboxKey)}`)
+      if (res.ok) {
+        const data = await res.json()
+        const result = String(data?.result || '').toLowerCase()
+        if (result === 'deliverable') {
+          return { verified: true, method: 'kickbox', result }
+        }
+        return { verified: false, method: 'kickbox', result: result || 'unknown' }
+      }
+    } catch (e) { console.warn('Kickbox verify failed:', e) }
+  }
+  return { verified: false, method: 'none', result: null }
+}
+
+// ── Waterfall Step 6: Apollo people match ──
+async function enrichWithApollo(firstName: string, lastName: string, company: string | null, linkedinUrl: string | null, apolloKey: string): Promise<{
+  email: string | null
+  title: string | null
+  company: string | null
+  full_name: string | null
+  raw: any
+}> {
+  const empty = { email: null, title: null, company: null, full_name: null, raw: null }
+  if (!apolloKey) return empty
+  try {
+    const body: Record<string, any> = {}
+    if (firstName) body.first_name = firstName
+    if (lastName) body.last_name = lastName
+    if (company) body.organization_name = company
+    if (linkedinUrl) body.linkedin_url = linkedinUrl
+    const res = await fetch('https://api.apollo.io/v1/people/match', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apolloKey },
+      body: JSON.stringify(body),
+    })
+    const data = await res.json()
+    if (!res.ok) return { ...empty, raw: data }
+    const person = data?.person || {}
+    return {
+      email: person.email || null,
+      title: person.title || person.headline || null,
+      company: person.organization?.name || person.organization_name || null,
+      full_name: person.name || (person.first_name && person.last_name ? `${person.first_name} ${person.last_name}` : null),
+      raw: data,
+    }
+  } catch (e) {
+    console.warn('Apollo enrichment failed:', e)
+    return empty
+  }
+}
+
+// ── Helper: insert enrichment_debug_logs row (best-effort) ──
+async function logDebug(db: any, userId: string, provider: string, requestPayload: any, responsePayload: any, statusCode: number) {
+  try {
+    await db.from('enrichment_debug_logs').insert({
+      user_id: userId, provider,
+      request_payload: requestPayload,
+      response_payload: responsePayload,
+      status_code: statusCode,
+    })
+  } catch {}
+}
+
+// ── Helper: refund a previously-deducted credit (manual decrement) ──
+async function refundCredit(db: any, userId: string) {
+  try {
+    const { data: current } = await db.from('credits').select('lookups_used').eq('user_id', userId).maybeSingle()
+    if (current && typeof current.lookups_used === 'number' && current.lookups_used > 0) {
+      await db.from('credits').update({ lookups_used: current.lookups_used - 1 }).eq('user_id', userId)
+    }
+  } catch (e) { console.error('refundCredit failed (non-fatal):', e) }
+}
+
+// ── Full waterfall orchestrator: Steps 3-7, returns first verified email or falls through ──
+interface WaterfallResult {
+  full_name: string | null
+  work_email: string | null
+  personal_email: string | null
+  title: string | null
+  company: string | null
+  company_domain: string | null
+  email_source: 'claude_pattern' | 'google_search' | 'apollo' | 'fullenrich' | null
+  title_verified: boolean
+  raw: any
+  steps: Array<{ provider: string; note: string }>
+  fullenrich_failed: boolean
+}
+
+async function runEnrichmentWaterfall(params: {
+  db: any
+  userId: string
+  linkedinUrl: string
+  firstName: string
+  lastName: string
+  fullName: string
+  companyHint: string | null
+  keys: {
+    anthropic: string
+    google: string
+    googleCx: string
+    myemailverifier: string
+    kickbox: string
+    apollo: string
+    fullenrich: string
+  }
+}): Promise<WaterfallResult> {
+  const { db, userId, linkedinUrl, firstName, lastName, fullName, companyHint, keys } = params
+  const steps: Array<{ provider: string; note: string }> = []
+  const result: WaterfallResult = {
+    full_name: fullName || null,
+    work_email: null,
+    personal_email: null,
+    title: null,
+    company: companyHint || null,
+    company_domain: null,
+    email_source: null,
+    title_verified: false,
+    raw: null,
+    steps,
+    fullenrich_failed: false,
+  }
+
+  const candidatePool: Array<{ email: string; origin: 'claude_pattern' | 'google_search' }> = []
+
+  // Step 3 — Claude Haiku pattern guess
+  if (fullName && companyHint && keys.anthropic) {
+    try {
+      const patterns = await generateEmailPatterns(fullName, companyHint, keys.anthropic)
+      for (const p of patterns) candidatePool.push({ email: p.toLowerCase(), origin: 'claude_pattern' })
+      await logDebug(db, userId, 'claude_pattern', { fullName, companyHint }, { candidates: patterns }, 200)
+      steps.push({ provider: 'claude_pattern', note: `generated ${patterns.length} candidate(s)` })
+    } catch (e: any) {
+      await logDebug(db, userId, 'claude_pattern', { fullName, companyHint }, { error: String(e?.message || e) }, 500)
+      steps.push({ provider: 'claude_pattern', note: 'failed' })
+    }
+  }
+
+  // Step 4 — Google Custom Search
+  if ((firstName || lastName) && keys.google && keys.googleCx) {
+    try {
+      const found = await searchGoogleForEmail(firstName, lastName, companyHint, keys.google, keys.googleCx)
+      for (const e of found) {
+        if (!candidatePool.some(c => c.email === e)) candidatePool.push({ email: e, origin: 'google_search' })
+      }
+      await logDebug(db, userId, 'google_cse', { firstName, lastName, companyHint }, { found }, 200)
+      steps.push({ provider: 'google_cse', note: `found ${found.length} email(s)` })
+    } catch (e: any) {
+      await logDebug(db, userId, 'google_cse', { firstName, lastName, companyHint }, { error: String(e?.message || e) }, 500)
+      steps.push({ provider: 'google_cse', note: 'failed' })
+    }
+  }
+
+  // Step 5 — verify each candidate (stop on first verified)
+  if (candidatePool.length > 0 && (keys.myemailverifier || keys.kickbox)) {
+    for (const cand of candidatePool) {
+      const v = await verifyEmail(cand.email, keys.myemailverifier, keys.kickbox)
+      await logDebug(db, userId, `verify_${v.method}`, { email: cand.email }, { verified: v.verified, result: v.result }, v.method === 'none' ? 500 : 200)
+      if (v.verified) {
+        result.work_email = cand.email
+        result.email_source = cand.origin
+        steps.push({ provider: 'verify', note: `verified ${cand.email} via ${v.method}` })
+        return result
+      }
+    }
+    steps.push({ provider: 'verify', note: 'no candidates verified' })
+  }
+
+  // Step 6 — Apollo fallback
+  if (keys.apollo) {
+    try {
+      const apollo = await enrichWithApollo(firstName, lastName, companyHint, linkedinUrl, keys.apollo)
+      await logDebug(db, userId, 'apollo', { firstName, lastName, companyHint, linkedinUrl }, apollo.raw || {}, apollo.email ? 200 : 204)
+      if (apollo.full_name && !result.full_name) result.full_name = apollo.full_name
+      if (apollo.title) { result.title = apollo.title; result.title_verified = true }
+      if (apollo.company && !result.company) result.company = apollo.company
+      if (apollo.email) {
+        const v = await verifyEmail(apollo.email, keys.myemailverifier, keys.kickbox)
+        await logDebug(db, userId, `verify_${v.method}`, { email: apollo.email, source: 'apollo' }, { verified: v.verified, result: v.result }, v.method === 'none' ? 500 : 200)
+        if (v.verified) {
+          result.work_email = apollo.email.toLowerCase()
+          result.email_source = 'apollo'
+          steps.push({ provider: 'apollo', note: `verified ${apollo.email}` })
+          return result
+        }
+        // Accept Apollo email even unverified if no verifier is configured at all
+        if (!keys.myemailverifier && !keys.kickbox) {
+          result.work_email = apollo.email.toLowerCase()
+          result.email_source = 'apollo'
+          steps.push({ provider: 'apollo', note: 'accepted without verification (no verifier keys)' })
+          return result
+        }
+        steps.push({ provider: 'apollo', note: 'email returned but failed verification' })
+      } else {
+        steps.push({ provider: 'apollo', note: 'no email returned' })
+      }
+    } catch (e: any) {
+      await logDebug(db, userId, 'apollo', { firstName, lastName }, { error: String(e?.message || e) }, 500)
+      steps.push({ provider: 'apollo', note: 'failed' })
+    }
+  }
+
+  // Step 7 — FullEnrich (last resort)
+  if (keys.fullenrich) {
+    let enrichRaw: any = null
+    let enrichStatus = 0
+    try {
+      const fe = await enrichWithLinkedInV2(linkedinUrl, keys.fullenrich)
+      enrichRaw = fe.raw
+      enrichStatus = 200
+      result.raw = fe.raw
+      if (fe.full_name && !result.full_name) result.full_name = fe.full_name
+      if (fe.title) { result.title = fe.title; result.title_verified = true }
+      if (fe.company && !result.company) result.company = fe.company
+      if (fe.company_domain) result.company_domain = fe.company_domain
+      if (fe.work_email) {
+        result.work_email = fe.work_email
+        result.email_source = 'fullenrich'
+      } else if (fe.personal_email) {
+        result.personal_email = fe.personal_email
+        result.email_source = 'fullenrich'
+      }
+      steps.push({ provider: 'fullenrich', note: fe.work_email ? 'found work email' : fe.personal_email ? 'found personal email only' : 'no email' })
+    } catch (e: any) {
+      enrichRaw = { error: String(e?.message || e) }
+      enrichStatus = 500
+      result.fullenrich_failed = true
+      steps.push({ provider: 'fullenrich', note: 'failed' })
+    } finally {
+      await logDebug(db, userId, 'fullenrich_v2', { linkedin_url: linkedinUrl, company_hint: companyHint }, enrichRaw, enrichStatus)
+    }
+  }
+
+  return result
+}
+
 // ── Employer resolution from email domain ──
 async function resolveEmployer(domain: string, db: any, anthropicKey: string): Promise<{ company: string; confidence: number }> {
   const { data: cached } = await db.from('company_domains').select('canonical_company_name,confidence').eq('domain', domain).single()
@@ -262,7 +562,22 @@ Deno.serve(async (req: Request) => {
   const serviceKey    = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
   const anthropicKey  = Deno.env.get('ANTHROPIC_API_KEY') || ''
   const fullenrichKey = Deno.env.get('FULLENRICH_API_KEY') || ''
+  const googleKey     = Deno.env.get('GOOGLE_CSE_API_KEY') || ''
+  const googleCx      = Deno.env.get('GOOGLE_CSE_CX') || ''
+  const myemailverifierKey = Deno.env.get('MYEMAILVERIFIER_API_KEY') || ''
+  const kickboxKey    = Deno.env.get('KICKBOX_API_KEY') || ''
+  const apolloKey     = Deno.env.get('APOLLO_API_KEY') || ''
   const db = createClient(supabaseUrl, serviceKey)
+
+  const waterfallKeys = {
+    anthropic: anthropicKey,
+    google: googleKey,
+    googleCx: googleCx,
+    myemailverifier: myemailverifierKey,
+    kickbox: kickboxKey,
+    apollo: apolloKey,
+    fullenrich: fullenrichKey,
+  }
 
   const authHeader = req.headers.get('Authorization') || ''
   const token = authHeader.replace(/^Bearer\s+/i, '').trim()
@@ -624,24 +939,43 @@ Return ONLY the bullet list — no intro sentence, no JSON, no extra commentary.
         return json({ error: { code: 'CREDIT_LIMIT_REACHED', message: 'Credit limit reached. Upgrade to continue enriching.' } }, 402)
       }
 
-      // Run FullEnrich
+      // Run waterfall (Steps 3-7)
       try {
-        const enrichResult = await enrichWithLinkedInV2(candidate.linkedin_url, fullenrichKey)
+        const cName = (candidate.first_name || candidate.last_name)
+          ? `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim()
+          : ''
+        const enrichResult = await runEnrichmentWaterfall({
+          db, userId: user.id,
+          linkedinUrl: candidate.linkedin_url,
+          firstName: candidate.first_name || '',
+          lastName: candidate.last_name || '',
+          fullName: cName,
+          companyHint: candidate.current_company || null,
+          keys: waterfallKeys,
+        })
+
         const email = enrichResult.work_email || enrichResult.personal_email || null
         const emailStatus = enrichResult.work_email ? 'found' : enrichResult.personal_email ? 'uncertain' : 'not_found'
         const newStatus = email ? 'enriched' : 'no_email'
+
+        if (!email && !enrichResult.full_name && enrichResult.fullenrich_failed) {
+          await refundCredit(db, user.id)
+          await db.from('campaign_candidates').update({ status: 'failed', updated_at: new Date().toISOString() }).eq('id', candidateId)
+          return json({ error: { code: 'ENRICHMENT_FAILED', message: 'Enrichment failed across all providers.' } }, 500)
+        }
 
         // Upsert into saved_profiles
         const { data: savedProfile } = await db.from('saved_profiles').upsert({
           user_id:        user.id,
           linkedin_url:   candidate.linkedin_url,
-          full_name:      enrichResult.full_name || `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || null,
+          full_name:      enrichResult.full_name || cName || null,
           work_email:     enrichResult.work_email || null,
           personal_email: enrichResult.personal_email || null,
           title:          enrichResult.title || null,
           company:        enrichResult.company || null,
-          title_verified: !!enrichResult.title,
+          title_verified: enrichResult.title_verified,
           email_status:   emailStatus,
+          email_source:   enrichResult.email_source,
           raw_data:       enrichResult.raw,
           enriched_at:    new Date().toISOString(),
           updated_at:     new Date().toISOString(),
@@ -663,9 +997,10 @@ Return ONLY the bullet list — no intro sentence, no JSON, no extra commentary.
 
         await _incrementCampaignCount(db, candidate.campaign_id, 'enriched_count')
 
-        return json({ status: newStatus, fromCache: false, email })
+        return json({ status: newStatus, fromCache: false, email, emailSource: enrichResult.email_source })
       } catch (e: any) {
-        console.error('enrich-campaign-candidate FullEnrich failed:', e)
+        console.error('enrich-campaign-candidate waterfall failed:', e)
+        await refundCredit(db, user.id)
         await db.from('campaign_candidates').update({ status: 'failed', updated_at: new Date().toISOString() }).eq('id', candidateId)
         return json({ error: { code: 'ENRICHMENT_FAILED', message: e.message || 'Enrichment failed.' } }, 500)
       }
@@ -937,73 +1272,76 @@ Return ONLY the bullet list — no intro sentence, no JSON, no extra commentary.
     let companyConfidence = companyHint ? 0.7 : 0.3
     let titleVerified = false
     let rawDataPayload: any = null
+    let emailSource: WaterfallResult['email_source'] = null
 
-    if (fullenrichKey) {
-      let enrichRaw: any = null
-      let enrichStatus = 0
-      try {
-        const enrichResult = await enrichWithLinkedInV2(linkedinUrl, fullenrichKey)
-        enrichRaw       = enrichResult.raw
-        rawDataPayload  = enrichResult.raw
-        enrichStatus = 200
+    // Derive first/last name from fullNameHint for Steps 3/4/6
+    const nameParts = (fullNameHint || '').trim().split(/\s+/).filter(Boolean)
+    const firstName = nameParts[0] || ''
+    const lastName  = nameParts.length > 1 ? nameParts.slice(1).join(' ') : ''
 
-        if (enrichResult.full_name) { fullName = enrichResult.full_name; personConfidence = 0.95 }
+    const waterfall = await runEnrichmentWaterfall({
+      db, userId: user.id,
+      linkedinUrl,
+      firstName, lastName,
+      fullName: fullNameHint || '',
+      companyHint,
+      keys: waterfallKeys,
+    })
 
-        work_email     = enrichResult.work_email
-        personal_email = enrichResult.personal_email
-        selectedEmail  = work_email || personal_email || null
-        emailStatus    = work_email ? 'found' : personal_email ? 'uncertain' : 'not_found'
-        if (work_email) emailDomain = work_email.split('@')[1] || null
-        else if (personal_email) emailDomain = personal_email.split('@')[1] || null
+    if (waterfall.full_name) { fullName = waterfall.full_name; personConfidence = 0.95 }
+    work_email     = waterfall.work_email
+    personal_email = waterfall.personal_email
+    selectedEmail  = work_email || personal_email || null
+    emailStatus    = work_email ? 'found' : personal_email ? 'uncertain' : 'not_found'
+    emailSource    = waterfall.email_source
+    rawDataPayload = waterfall.raw
 
-        if (enrichResult.company) {
-          company = enrichResult.company
-          companyDomain = enrichResult.company_domain
-          companyConfidence = 0.95
-        } else if (enrichResult.company_domain) {
-          companyDomain = enrichResult.company_domain
-        }
+    if (work_email) emailDomain = work_email.split('@')[1] || null
+    else if (personal_email) emailDomain = personal_email.split('@')[1] || null
 
-        if (enrichResult.title) { providerTitle = enrichResult.title; titleVerified = true }
-
-        try {
-          const earlyEmailStatus = enrichResult.work_email ? 'found' : enrichResult.personal_email ? 'uncertain' : 'not_found'
-          await db.from('saved_profiles').upsert({
-            user_id: user.id, linkedin_url: linkedinUrl,
-            full_name: enrichResult.full_name || fullName || null,
-            work_email: enrichResult.work_email || null,
-            personal_email: enrichResult.personal_email || null,
-            title: enrichResult.title || null,
-            company: enrichResult.company || companyHint || null,
-            title_verified: !!enrichResult.title,
-            email_status: earlyEmailStatus,
-            raw_data: enrichResult.raw,
-            enriched_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          }, { onConflict: 'user_id,linkedin_url', ignoreDuplicates: false })
-        } catch (e) { console.error('early upsert failed (non-fatal):', e) }
-
-        sources.push({ type: 'fullenrich_v2', label: 'LinkedIn URL enrichment', confidence: 0.95 })
-      } catch (e: any) {
-        console.error('FullEnrich v2 failed:', e)
-        enrichRaw    = { error: String(e?.message || e) }
-        enrichStatus = 500
-        sources.push({ type: 'fullenrich_v2', label: 'Enrichment unavailable', confidence: 0 })
-      } finally {
-        try {
-          await db.from('enrichment_debug_logs').insert({
-            user_id: user.id, provider: 'fullenrich_v2',
-            request_payload: { linkedin_url: linkedinUrl, company_hint: companyHint },
-            response_payload: enrichRaw,
-            status_code: enrichStatus,
-          })
-        } catch {}
-      }
-    } else {
-      console.warn('FULLENRICH_API_KEY not set — skipping enrichment')
+    if (waterfall.company) {
+      if (!companyHint) companyConfidence = 0.95
+      company = waterfall.company
     }
+    if (waterfall.company_domain) companyDomain = waterfall.company_domain
 
-    if (!fullName) return json({ error: { code: 'NOT_ENOUGH_DATA', message: 'Could not identify this person. Try again or check the LinkedIn profile URL.' } }, 422)
+    if (waterfall.title) { providerTitle = waterfall.title; titleVerified = waterfall.title_verified }
+
+    const sourceLabel = (s: WaterfallResult['email_source']): { type: string; label: string; confidence: number } | null => {
+      switch (s) {
+        case 'claude_pattern': return { type: 'claude_pattern', label: 'Email pattern guessed and verified', confidence: 0.85 }
+        case 'google_search':  return { type: 'google_search',  label: 'Email found via public search',     confidence: 0.85 }
+        case 'apollo':         return { type: 'apollo',         label: 'Apollo enrichment',                  confidence: 0.90 }
+        case 'fullenrich':     return { type: 'fullenrich_v2',  label: 'LinkedIn URL enrichment',           confidence: 0.95 }
+        default: return null
+      }
+    }
+    const srcLabel = sourceLabel(emailSource)
+    if (srcLabel) sources.push(srcLabel)
+    else if (waterfall.fullenrich_failed) sources.push({ type: 'fullenrich_v2', label: 'Enrichment unavailable', confidence: 0 })
+
+    // Early upsert so partial results are not lost if later steps throw
+    try {
+      await db.from('saved_profiles').upsert({
+        user_id: user.id, linkedin_url: linkedinUrl,
+        full_name: fullName || null,
+        work_email: work_email || null,
+        personal_email: personal_email || null,
+        title: providerTitle || null,
+        company: company || null,
+        title_verified: titleVerified,
+        email_status: emailStatus,
+        email_source: emailSource,
+        raw_data: rawDataPayload,
+        enriched_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'user_id,linkedin_url', ignoreDuplicates: false })
+    } catch (e) { console.error('early upsert failed (non-fatal):', e) }
+
+    if (!fullName) {
+      await refundCredit(db, user.id)
+      return json({ error: { code: 'NOT_ENOUGH_DATA', message: 'Could not identify this person. Try again or check the LinkedIn profile URL.' } }, 422)
+    }
 
     if (emailDomain && !company) {
       try {
@@ -1066,6 +1404,7 @@ Return ONLY the bullet list — no intro sentence, no JSON, no extra commentary.
       const { data: run } = await db.from('outreach_runs').insert({
         user_id: user.id, full_name: fullName, company: company || null,
         title: title || null, email: work_email || null, email_status: emailStatus,
+        email_source: emailSource,
         person_confidence: personConfidence, company_confidence: companyConfidence,
         title_confidence: titleConfidence, draft_confidence: draftConfidence,
         user_context: userContext, company_hint: companyHint,
@@ -1081,7 +1420,8 @@ Return ONLY the bullet list — no intro sentence, no JSON, no extra commentary.
         user_id: user.id, linkedin_url: linkedinUrl, full_name: fullName,
         work_email: work_email || null, personal_email: personal_email || null,
         title: title || null, company: company || null, title_verified: titleVerified,
-        email_status: emailStatus, enriched_at: new Date().toISOString(),
+        email_status: emailStatus, email_source: emailSource,
+        enriched_at: new Date().toISOString(),
         updated_at: new Date().toISOString(), raw_data: rawDataPayload || null,
       }, { onConflict: 'user_id,linkedin_url', ignoreDuplicates: false })
 
@@ -1098,7 +1438,7 @@ Return ONLY the bullet list — no intro sentence, no JSON, no extra commentary.
       person: {
         fullName, company: company || null, title: title || null, titleVerified,
         email: selectedEmail || null, workEmail: work_email || null,
-        personalEmail: personal_email || null, emailStatus,
+        personalEmail: personal_email || null, emailStatus, emailSource,
       },
       confidence: { personConfidence, companyConfidence, titleConfidence, draftConfidence },
       sources,
