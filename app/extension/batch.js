@@ -33,6 +33,22 @@ export function closeBatchDrawer() {
   if (!drawer) return
   drawer.classList.remove('open')
   _batchRunId++
+
+  // Reset all session state so re-opening shows a clean campaign list.
+  _activeCampaignId = null
+  _allCandidates    = []
+  _parsedCandidates = []
+  _reviewIndex      = 0
+
+  // Hide the processing and review steps; Steps 1 & 2 are always-visible.
+  const step3 = $('batchStep3')
+  const step4 = $('batchStep4')
+  if (step3) step3.style.display = 'none'
+  if (step4) step4.style.display = 'none'
+
+  // Restore statusMessage visibility so the main tab is unaffected after closing.
+  const statusMsg = $('statusMessage')
+  if (statusMsg) statusMsg.style.display = ''
 }
 
 // ── CSV parser (RFC 4180, handles quoted fields and embedded newlines) ─────────
