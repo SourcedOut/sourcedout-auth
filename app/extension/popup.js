@@ -1,7 +1,7 @@
 // ─── popup.js ─────────────────────────────────────────────────────────────────
 import { CONFIG } from './config.js'
 import { isLoggedIn, sendMagicLink, signInWithGoogle, signInWithMicrosoft, signInWithEmailPassword, signUpWithEmailPassword, getUser, signOut, getAccessToken, resetPassword } from './core/auth.js'
-import { getCreditsData, enrichAndDraft, summarizeJob, bookmarkProfile, getSavedProfiles, checkSavedProfile, saveJob, getSavedJobs, deleteJob, openUpgradePage, parseErrorMessage, isAuthError } from './core/api.js'
+import { getCreditsData, enrichAndDraft, summarizeJob, fetchJobUrl, bookmarkProfile, getSavedProfiles, checkSavedProfile, saveJob, getSavedJobs, deleteJob, openUpgradePage, parseErrorMessage, isAuthError } from './core/api.js'
 
 // ── State machine ─────────────────────────────────────────────────────────────
 // States: IDLE | PREFILLED | SUBMITTING | ENRICHING | DRAFTING | SUCCESS | PARTIAL_SUCCESS | EMPTY_RESULT | AUTH_ERROR | GENERIC_ERROR
@@ -1203,27 +1203,10 @@ function setupJobTab() {
         return { ldTitle, ldCompany, ldDescription, ogTitle, ogSite, pageTitle, bodyText, bodyDesc }
       }
 
-      // Try background fetch first
-      let parsed = null
-      const bgResponse = await new Promise(resolve =>
-        chrome.runtime.sendMessage({ type: 'FETCH_URL', url }, resolve)
-      )
-      if (bgResponse?.ok && bgResponse.html) {
-        parsed = parseJobHTML(bgResponse.html)
-      }
-
-      // If fetch failed or returned no useful job data (SPA shell), try loading the page in a background tab
-      const hasUsefulData = parsed && (parsed.ldTitle || (parsed.ogTitle && !GENERIC.test(parsed.ogTitle)) || parsed.bodyText.length > 200)
-      if (!hasUsefulData) {
-        statusEl.textContent = 'Loading job page…'
-        const tabResponse = await new Promise(resolve =>
-          chrome.runtime.sendMessage({ type: 'SCRAPE_URL', url }, resolve)
-        )
-        if (tabResponse?.ok && tabResponse.html) {
-          parsed = parseJobHTML(tabResponse.html)
-        }
-        if (!parsed) throw new Error('Could not extract job details')
-      }
+      // Fetch HTML via edge function proxy (server-side, no CORS issues)
+      const proxyRes = await fetchJobUrl(url)
+      if (!proxyRes?.html) throw new Error('Could not load page')
+      const parsed = parseJobHTML(proxyRes.html)
 
       const { ldTitle, ldCompany, ldDescription, ogTitle, ogSite, pageTitle, bodyText, bodyDesc } = parsed
 
