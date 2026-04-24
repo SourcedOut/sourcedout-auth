@@ -1149,15 +1149,23 @@ function setupJobTab() {
     if (expiredWarn) expiredWarn.style.display = 'none'
 
     const DIRECTS = { 'google.com': 'Google', 'amazon.jobs': 'Amazon', 'microsoft.com': 'Microsoft', 'apple.com': 'Apple', 'meta.com': 'Meta', 'netflix.com': 'Netflix', 'stripe.com': 'Stripe', 'openai.com': 'OpenAI' }
-    const BOARDS  = ['greenhouse.io','lever.co','workday.com','myworkdayjobs.com','jobvite.com','smartrecruiters.com','ashbyhq.com','linkedin.com']
+    const BOARDS  = ['greenhouse.io','lever.co','workday.com','myworkdayjobs.com','jobvite.com','smartrecruiters.com','ashbyhq.com','linkedin.com','jibeapply.com']
     const GENERIC = /^(job details?|job description|apply( now)?|about this role|overview|open role|career opportunity|careers|current opening|job posting|view job|find your dream job)$/i
 
     // ── Step 1: Instant pre-fill from URL slug & hostname ─────────────────────
     let preTitle = '', preCompany = ''
     try {
-      const parsedHost = new URL(url).hostname.replace(/^www\./, '')
+      const parsed = new URL(url)
+      const parsedHost = parsed.hostname.replace(/^www\./, '')
       for (const [d, n] of Object.entries(DIRECTS)) { if (parsedHost.includes(d)) { preCompany = n; break } }
-      const slugPart = [...url.split('/')].reverse().find(p => /[a-zA-Z]/.test(p) && p.includes('-'))
+      // Extract company from ATS subdomains (e.g. githubinc.jibeapply.com)
+      if (!preCompany && parsedHost.includes('jibeapply.com')) {
+        const sub = parsedHost.split('.')[0].replace(/inc$/, '')
+        if (sub && sub !== 'www') preCompany = sub.charAt(0).toUpperCase() + sub.slice(1)
+      }
+      // Use pathname only (not query string) to find a human-readable slug
+      const pathSegments = parsed.pathname.split('/').filter(Boolean)
+      const slugPart = [...pathSegments].reverse().find(p => /[a-zA-Z]/.test(p) && p.includes('-') && !/^\d+$/.test(p))
       if (slugPart) preTitle = slugPart.replace(/^\d+-/, '').replace(/[-_]/g, ' ').trim().replace(/\b\w/g, c => c.toUpperCase())
     } catch {}
     if (preTitle)   $('jobTitle').value   = preTitle
