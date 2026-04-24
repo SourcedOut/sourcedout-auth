@@ -14,7 +14,7 @@
     "https://*.supabase.co/*",
     "https://mail.google.com/*",
     "https://outlook.live.com/*",
-    "https://*/*"
+    "https://app.fullenrich.com/*"
   ],
   "content_scripts": [
     {
