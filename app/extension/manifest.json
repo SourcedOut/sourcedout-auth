@@ -10,11 +10,7 @@
     "scripting"
   ],
   "host_permissions": [
-    "https://www.linkedin.com/*",
-    "https://*.supabase.co/*",
-    "https://mail.google.com/*",
-    "https://outlook.live.com/*",
-    "https://app.fullenrich.com/*"
+    "<all_urls>"
   ],
   "content_scripts": [
     {

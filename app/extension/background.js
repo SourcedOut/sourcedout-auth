@@ -18,19 +18,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true
   }
 
-  if (msg.type === 'SCRAPE_TAB') {
-    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-      const tab = tabs?.[0]
-      if (!tab?.id) { sendResponse({ ok: false, error: 'No active tab' }); return }
-      chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: () => document.documentElement.outerHTML
-      })
-        .then(results => {
-          const html = results?.[0]?.result || ''
-          sendResponse({ ok: !!html, html, error: html ? undefined : 'Empty page' })
-        })
-        .catch(err => sendResponse({ ok: false, error: err.message }))
+  if (msg.type === 'SCRAPE_URL') {
+    const cleanup = tabId => chrome.tabs.remove(tabId).catch(() => {})
+    chrome.tabs.create({ url: msg.url, active: false }, tab => {
+      if (chrome.runtime.lastError || !tab?.id) {
+        sendResponse({ ok: false, error: 'Could not open tab' })
+        return
+      }
+      const tabId = tab.id
+      const timeout = setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(listener)
+        cleanup(tabId)
+        sendResponse({ ok: false, error: 'Tab load timed out' })
+      }, 20000)
+      const listener = (updatedId, info) => {
+        if (updatedId !== tabId || info.status !== 'complete') return
+        chrome.tabs.onUpdated.removeListener(listener)
+        clearTimeout(timeout)
+        // Allow SPA frameworks a moment to render after load
+        setTimeout(() => {
+          chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => document.documentElement.outerHTML
+          })
+            .then(results => {
+              cleanup(tabId)
+              const html = results?.[0]?.result || ''
+              sendResponse({ ok: !!html, html, error: html ? undefined : 'Empty page' })
+            })
+            .catch(err => {
+              cleanup(tabId)
+              sendResponse({ ok: false, error: err.message })
+            })
+        }, 1500)
+      }
+      chrome.tabs.onUpdated.addListener(listener)
     })
     return true
   }

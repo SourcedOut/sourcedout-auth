@@ -1165,57 +1165,67 @@ function setupJobTab() {
       }
       // Use pathname only (not query string) to find a human-readable slug
       const pathSegments = parsed.pathname.split('/').filter(Boolean)
-      const slugPart = [...pathSegments].reverse().find(p => /[a-zA-Z]/.test(p) && p.includes('-') && !/^\d+$/.test(p))
+      const NAV_SLUG = /^(jobs?|careers?|positions?|openings?|apply|search|listing|posting|join-us|work-with-us|about|team|departments?)(-\w+)?$/i
+      const slugPart = [...pathSegments].reverse().find(p => /[a-zA-Z]/.test(p) && p.includes('-') && !/^\d+$/.test(p) && !NAV_SLUG.test(p))
       if (slugPart) preTitle = slugPart.replace(/^\d+-/, '').replace(/[-_]/g, ' ').trim().replace(/\b\w/g, c => c.toUpperCase())
     } catch {}
     if (preTitle)   $('jobTitle').value   = preTitle
     if (preCompany) $('jobCompany').value = preCompany
 
-    // ── Step 2: Fetch HTML — try background fetch first, fall back to active tab ──
+    // ── Step 2: Fetch HTML — try background fetch first, fall back to tab scrape for SPAs ──
     try {
-      let html = ''
+      // Helper: parse job data from an HTML string
+      const parseJobHTML = (html) => {
+        const doc = new DOMParser().parseFromString(html, 'text/html')
+        let ldTitle = '', ldCompany = '', ldDescription = ''
+        for (const s of doc.querySelectorAll('script[type="application/ld+json"]')) {
+          let data; try { data = JSON.parse(s.textContent) } catch { continue }
+          const nodes = data?.['@graph'] ? data['@graph'] : [data]
+          const job = nodes.find(n => n?.['@type'] === 'JobPosting')
+          if (job) {
+            ldTitle   = (job.title || '').trim()
+            ldCompany = (job.hiringOrganization?.name || '').trim()
+            const tmp = document.createElement('div')
+            tmp.innerHTML = job.description || ''
+            ldDescription = (tmp.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 600)
+            break
+          }
+        }
+        const ogTitle   = doc.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim() || ''
+        const ogSite    = doc.querySelector('meta[property="og:site_name"]')?.getAttribute('content')?.trim() || ''
+        const pageTitle = doc.title?.trim() || ''
+        const mainEl = doc.querySelector('main, article, [role="main"], #main-content') || doc.body
+        const NAV = /^(home|menu|skip|search|sign in|sign up|login|log in|careers|jobs|apply|share|back|next|prev|navigation|cookie|privacy|terms|©|\d{4})$/i
+        const bodyLines = (mainEl?.textContent || '').split('\n').map(l => l.trim()).filter(l => l.length > 40 && !NAV.test(l))
+        const bodyText  = bodyLines.join(' ')
+        const anchor    = bodyText.search(/minimum qualifications|about the job|about this role|responsibilities|what you.ll do|job summary/i)
+        const bodyDesc  = (anchor > -1 ? bodyText.slice(anchor) : bodyText).slice(0, 600)
+        return { ldTitle, ldCompany, ldDescription, ogTitle, ogSite, pageTitle, bodyText, bodyDesc }
+      }
+
+      // Try background fetch first
+      let parsed = null
       const bgResponse = await new Promise(resolve =>
         chrome.runtime.sendMessage({ type: 'FETCH_URL', url }, resolve)
       )
       if (bgResponse?.ok && bgResponse.html) {
-        html = bgResponse.html
-      } else {
+        parsed = parseJobHTML(bgResponse.html)
+      }
+
+      // If fetch failed or returned no useful job data (SPA shell), try loading the page in a background tab
+      const hasUsefulData = parsed && (parsed.ldTitle || (parsed.ogTitle && !GENERIC.test(parsed.ogTitle)) || parsed.bodyText.length > 200)
+      if (!hasUsefulData) {
+        statusEl.textContent = 'Loading job page…'
         const tabResponse = await new Promise(resolve =>
-          chrome.runtime.sendMessage({ type: 'SCRAPE_TAB' }, resolve)
+          chrome.runtime.sendMessage({ type: 'SCRAPE_URL', url }, resolve)
         )
-        if (!tabResponse?.ok) throw new Error(tabResponse?.error || 'Fetch failed')
-        html = tabResponse.html
-      }
-      const doc = new DOMParser().parseFromString(html, 'text/html')
-
-      // JSON-LD (best source — Google Careers, Greenhouse, Lever, Ashby all include this)
-      let ldTitle = '', ldCompany = '', ldDescription = ''
-      for (const s of doc.querySelectorAll('script[type="application/ld+json"]')) {
-        let data; try { data = JSON.parse(s.textContent) } catch { continue }
-        const nodes = data?.['@graph'] ? data['@graph'] : [data]
-        const job = nodes.find(n => n?.['@type'] === 'JobPosting')
-        if (job) {
-          ldTitle   = (job.title || '').trim()
-          ldCompany = (job.hiringOrganization?.name || '').trim()
-          const tmp = document.createElement('div')
-          tmp.innerHTML = job.description || ''
-          ldDescription = (tmp.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 600)
-          break
+        if (tabResponse?.ok && tabResponse.html) {
+          parsed = parseJobHTML(tabResponse.html)
         }
+        if (!parsed) throw new Error('Could not extract job details')
       }
 
-      // Meta tag fallbacks
-      const ogTitle   = doc.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim() || ''
-      const ogSite    = doc.querySelector('meta[property="og:site_name"]')?.getAttribute('content')?.trim() || ''
-      const pageTitle = doc.title?.trim() || ''
-
-      // Body text fallback (for description only)
-      const mainEl = doc.querySelector('main, article, [role="main"], #main-content') || doc.body
-      const NAV = /^(home|menu|skip|search|sign in|sign up|login|log in|careers|jobs|apply|share|back|next|prev|navigation|cookie|privacy|terms|©|\d{4})$/i
-      const bodyLines = (mainEl?.textContent || '').split('\n').map(l => l.trim()).filter(l => l.length > 40 && !NAV.test(l))
-      const bodyText  = bodyLines.join(' ')
-      const anchor    = bodyText.search(/minimum qualifications|about the job|about this role|responsibilities|what you.ll do|job summary/i)
-      const bodyDesc  = (anchor > -1 ? bodyText.slice(anchor) : bodyText).slice(0, 600)
+      const { ldTitle, ldCompany, ldDescription, ogTitle, ogSite, pageTitle, bodyText, bodyDesc } = parsed
 
       // ── Detect expired / unavailable job postings ──────────────────────────
       // Check page title + body for common "job gone" signals
